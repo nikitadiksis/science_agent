@@ -1,6 +1,6 @@
- .env
-  news_log.json
-  posted_news.json
-  news_agent.lock
-  __pycache__/
-  *.pyc
+.env
+news_log.json
+posted_news.json
+news_agent.lock
+__pycache__/
+*.pyc
