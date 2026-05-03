@@ -56,6 +56,9 @@ REQUEST_TIMEOUT_AI = 40
 REQUEST_TIMEOUT_TELEGRAM = (10, 30)  # 10 сек подключение, 30 сек ответ
 TELEGRAM_MAX_ATTEMPTS = 2
 TELEGRAM_RETRY_SLEEP_SECONDS = 3
+TELEGRAM_MESSAGE_LIMIT = 4096
+TELEGRAM_MESSAGE_SAFE_LIMIT = 3900
+TELEGRAM_HASHTAGS = "#science #news"
 
 MAX_RSS_ITEMS_PER_FEED = 10
 MAX_RSS_RESPONSE_BYTES = 2_000_000
@@ -879,6 +882,26 @@ def build_telegram_post(rewritten_plain: str, source_url: str) -> str:
     title = lines[0].strip()
     body = "\n".join(lines[1:]).strip()
 
+    source_part = ""
+    if is_safe_url(source_url):
+        safe_url = safe_attr(normalize_url(source_url))
+        source_part = f"<a href=\"{safe_url}\">🔗 Источник</a>"
+
+    fixed_parts = [f"<b>{safe_html_text(title)}</b>"]
+    if source_part:
+        fixed_parts.extend(["", source_part])
+    fixed_parts.extend(["", TELEGRAM_HASHTAGS])
+
+    fixed_len = len("\n".join(fixed_parts))
+    body_budget = TELEGRAM_MESSAGE_SAFE_LIMIT - fixed_len - 2
+    if body_budget < 0:
+        body_budget = 0
+
+    if body and len(safe_html_text(body)) > body_budget:
+        while body and len(safe_html_text(body + "...")) > body_budget:
+            body = body[:-80].rstrip()
+        body = (body.rstrip() + "...") if body else ""
+
     title_html = f"<b>{safe_html_text(title)}</b>"
     body_html = safe_html_text(body)
 
@@ -887,10 +910,9 @@ def build_telegram_post(rewritten_plain: str, source_url: str) -> str:
         parts.append("")
         parts.append(body_html)
 
-    if is_safe_url(source_url):
-        safe_url = safe_attr(normalize_url(source_url))
+    if source_part:
         parts.append("")
-        parts.append(f"<a href=\"{safe_url}\">🔗 Источник</a>")
+        parts.append(source_part)
 
     return "\n".join(parts).strip()
 
@@ -1680,9 +1702,13 @@ def is_semantic_duplicate_with_cache(news_embedding, cached_items, cached_embedd
 def send_to_telegram(text: str, chat_id: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-    final_text = text + "\n\n#science #news"
-    if len(final_text) > 4000:
-        final_text = final_text[:4000] + "..."
+    final_text = text
+    if TELEGRAM_HASHTAGS not in final_text:
+        final_text = f"{final_text}\n\n{TELEGRAM_HASHTAGS}"
+
+    if len(final_text) > TELEGRAM_MESSAGE_LIMIT:
+        print(f"   ❌ Telegram текст слишком длинный после безопасной сборки: {len(final_text)}")
+        return False
 
     for attempt in range(1, TELEGRAM_MAX_ATTEMPTS + 1):
         try:
