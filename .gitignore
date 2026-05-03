@@ -2,5 +2,6 @@
 news_log.json
 posted_news.json
 news_agent.lock
+*.bad.*
 __pycache__/
 *.pyc

@@ -46,6 +46,7 @@ MAX_NEWS_FOR_AI = 20
 DB_FILE = "posted_news.json"
 LOG_FILE = "news_log.json"
 LOCK_FILE = "news_agent.lock"
+JSON_BACKUP_SUFFIX = ".bad"
 
 POSTS_PER_RUN = 1
 DEDUP_LOOKBACK = 80
@@ -681,21 +682,30 @@ def get_source_name(item: dict) -> str:
 # =========================================================
 # РАБОТА С БД И ЛОГАМИ
 # =========================================================
-def load_json_file(path: str, default):
+def load_json_file(path: str, default, strict: bool = False):
     if not os.path.exists(path):
         return default
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data
-    except Exception:
+    except Exception as e:
+        if strict:
+            raise RuntimeError(f"Не удалось прочитать JSON {path}: {e}") from e
+        backup_path = f"{path}{JSON_BACKUP_SUFFIX}.{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        try:
+            os.replace(path, backup_path)
+            print(f"⚠️ Битый JSON {path} сохранён как {backup_path}")
+        except Exception as backup_error:
+            print(f"⚠️ Не удалось сохранить битый JSON {path}: {str(backup_error)[:120]}")
+        print(f"⚠️ Не удалось прочитать JSON {path}, используется пустая структура: {str(e)[:120]}")
         return default
 
 
 def load_db():
-    data = load_json_file(DB_FILE, {"posted": []})
+    data = load_json_file(DB_FILE, {"posted": []}, strict=True)
     if not isinstance(data, dict) or "posted" not in data or not isinstance(data["posted"], list):
-        return {"posted": []}
+        raise RuntimeError(f"Некорректная структура {DB_FILE}: ожидается объект с массивом posted")
     return data
 
 
