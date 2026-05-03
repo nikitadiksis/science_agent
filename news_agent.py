@@ -17,7 +17,12 @@ from collections import defaultdict
 import requests
 from dotenv import load_dotenv
 from defusedxml import ElementTree as ET
-from sentence_transformers import SentenceTransformer, util
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 
 # =========================================================
@@ -893,6 +898,8 @@ SEMANTIC_MODEL = None
 def get_semantic_model():
     global SEMANTIC_MODEL
     if SEMANTIC_MODEL is None:
+        from sentence_transformers import SentenceTransformer
+
         print("Загрузка модели для семантической дедупликации...")
         SEMANTIC_MODEL = SentenceTransformer(SEMANTIC_MODEL_NAME)
         print("Модель загружена.\n")
@@ -1083,7 +1090,7 @@ def fetch_rss(source: dict):
             content_chunks.append(chunk_bytes)
 
         raw_content = b"".join(content_chunks)
-        encoding = response.encoding or response.apparent_encoding or "utf-8"
+        encoding = response.encoding or "utf-8"
         content = raw_content.decode(encoding, errors="replace")
         content = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", content)
 
@@ -1135,7 +1142,7 @@ def check_feeds():
 
     print("=" * 60)
     print(f"Итого материалов: {total}, пустых/ошибочных источников: {failed}")
-    return failed == 0
+    return total > 0
 
 
 # =========================================================
@@ -1684,7 +1691,7 @@ def get_embedding_as_list(text: str):
     return emb.tolist() if hasattr(emb, "tolist") else list(emb)
 
 
-def ensure_db_embeddings(db: dict, lookback=DEDUP_LOOKBACK) -> dict:
+def ensure_db_embeddings(db: dict, lookback=DEDUP_LOOKBACK, persist: bool = True) -> dict:
     posted = db.get("posted", [])
     if not posted:
         return db
@@ -1708,7 +1715,7 @@ def ensure_db_embeddings(db: dict, lookback=DEDUP_LOOKBACK) -> dict:
         except Exception as e:
             print(f"   ⚠️ Не удалось достроить embedding для старой записи: {str(e)[:120]}")
 
-    if changed:
+    if changed and persist:
         save_db(db)
 
     return db
@@ -1734,6 +1741,7 @@ def is_semantic_duplicate_with_cache(news_embedding, cached_items, cached_embedd
 
     try:
         import torch
+        from sentence_transformers import util
 
         emb_new = torch.tensor([news_embedding], dtype=torch.float32)
         emb_old_all = torch.tensor(cached_embeddings, dtype=torch.float32)
@@ -1856,7 +1864,7 @@ def main(dry_run: bool = False):
         print(f"   Всего собрано: {len(all_news)}")
 
         db = load_db()
-        db = ensure_db_embeddings(db, lookback=DEDUP_LOOKBACK)
+        db = ensure_db_embeddings(db, lookback=DEDUP_LOOKBACK, persist=not dry_run)
         cached_items, cached_embeddings = build_recent_embedding_cache(db, lookback=DEDUP_LOOKBACK)
 
         fresh_news = []
