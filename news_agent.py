@@ -68,6 +68,8 @@ SEND_RUN_REPORT_TO_ADMIN = True
 
 # Редакционные ограничения
 MAX_CONSECUTIVE_SAME_TOPIC = 2
+SOURCE_REPEAT_LOOKBACK = 3
+MAX_SAME_SOURCE_IN_LOOKBACK = 1
 DEFAULT_SOURCE_LIMIT_FOR_AI = 4
 SOURCE_LIMITS_FOR_AI = {
     "Medical Xpress": 1,
@@ -805,6 +807,7 @@ def format_run_report(stats: dict) -> str:
         f"Прошли AI-фильтр: {stats.get('passed_ai', 0)}\n"
         f"Низкий AI-score: {stats.get('low_score', 0)}\n"
         f"Срезано лимитом тем: {stats.get('topic_streak_skipped', 0)}\n"
+        f"Срезано лимитом источников: {stats.get('source_streak_skipped', 0)}\n"
         f"Ошибки rewrite: {stats.get('rewrite_failed', 0)}\n"
         f"Ошибки Telegram: {stats.get('telegram_failed', 0)}\n"
         f"Опубликовано: {stats.get('published', 0)}"
@@ -1332,6 +1335,33 @@ def violates_topic_streak(candidate_topic: str, posted_news: list, max_streak=MA
     return streak >= max_streak
 
 
+def violates_source_repeat(
+    candidate_source: str,
+    posted_news: list,
+    lookback=SOURCE_REPEAT_LOOKBACK,
+    max_same_source=MAX_SAME_SOURCE_IN_LOOKBACK,
+) -> bool:
+    if not candidate_source:
+        return False
+
+    recent_sources = []
+    for item in reversed(posted_news):
+        source = item.get("source")
+        if not source:
+            continue
+        recent_sources.append(source)
+        if len(recent_sources) >= lookback:
+            break
+
+    if not recent_sources:
+        return False
+
+    if recent_sources[0] == candidate_source:
+        return True
+
+    return recent_sources.count(candidate_source) >= max_same_source
+
+
 # =========================================================
 # AI
 # =========================================================
@@ -1708,6 +1738,7 @@ def main():
         "passed_ai": 0,
         "low_score": 0,
         "topic_streak_skipped": 0,
+        "source_streak_skipped": 0,
         "rewrite_failed": 0,
         "telegram_failed": 0,
         "published": 0,
@@ -1913,6 +1944,7 @@ def main():
 
         published_count = 0
         skipped_due_topic_streak = []
+        skipped_due_source_streak = []
         posted_news_for_streak = load_db().get("posted", [])
 
         # Сначала пробуем новости, которые не станут третьими подряд на одну тему.
@@ -1932,6 +1964,24 @@ def main():
         else:
             ordered_candidates = scored_news
             print("   ⚠️ Все подходящие новости нарушают лимит темы, включён fallback")
+
+        source_allowed_candidates = []
+        source_blocked_candidates = []
+        for candidate in ordered_candidates:
+            candidate_source = get_source_name(candidate["item"])
+            if violates_source_repeat(candidate_source, posted_news_for_streak):
+                source_blocked_candidates.append(candidate)
+            else:
+                source_allowed_candidates.append(candidate)
+
+        if source_allowed_candidates:
+            ordered_candidates = source_allowed_candidates
+            stats["source_streak_skipped"] = len(source_blocked_candidates)
+            skipped_due_source_streak = source_blocked_candidates
+        else:
+            stats["source_streak_skipped"] = len(source_blocked_candidates)
+            skipped_due_source_streak = source_blocked_candidates
+            print("   ⚠️ Все подходящие новости нарушают лимит источника, включён fallback")
 
         for candidate in ordered_candidates:
             if published_count >= POSTS_PER_RUN:
@@ -2027,7 +2077,7 @@ def main():
                 print("   ✅ Опубликовано и записано в базу")
                 published_count += 1
                 stats["published"] += 1
-                posted_news_for_streak.append({"topic": candidate["topic"]})
+                posted_news_for_streak.append({"topic": candidate["topic"], "source": source_for_log})
             else:
                 stats["telegram_failed"] += 1
                 print("   ❌ Публикация не удалась. Новость НЕ записана в posted_news.json")
@@ -2039,8 +2089,11 @@ def main():
                 )
                 notify_admin(f"Ошибка отправки в Telegram: {safe_html_text(item['title'][:120])}")
 
+        if published_count == 0 and skipped_due_source_streak:
+            skipped_due_topic_streak = skipped_due_source_streak + skipped_due_topic_streak
+
         if published_count == 0 and skipped_due_topic_streak:
-            print("\n⚠️ Разрешённые по теме кандидаты не опубликованы. Пробую fallback из срезанных тем.")
+            print("\n⚠️ Кандидаты после лимитов не опубликованы. Пробую fallback из резервных кандидатов.")
 
             for candidate in skipped_due_topic_streak:
                 if published_count >= POSTS_PER_RUN:
@@ -2078,6 +2131,7 @@ def main():
                     )
                     stats["published"] += 1
                     published_count += 1
+                    posted_news_for_streak.append({"topic": candidate["topic"], "source": source_for_log})
                     log_news_check(
                         item["title"], item["link"], candidate["pre_score"], candidate["score"],
                         candidate["topic"], source_for_log, published=True, error="topic_streak_fallback",
