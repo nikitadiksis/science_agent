@@ -3,6 +3,7 @@
 
 import os
 import re
+import sys
 import json
 import hashlib
 import tempfile
@@ -772,7 +773,20 @@ def mark_posted(url: str, title: str, summary: str = "", embedding=None, topic: 
     save_db(db)
 
 
-def log_news_check(title, url, pre_score, ai_score, topic, source, published=False, error=None, scale_score=None, final_score=None):
+def log_news_check(
+    title,
+    url,
+    pre_score,
+    ai_score,
+    topic,
+    source,
+    published=False,
+    error=None,
+    scale_score=None,
+    final_score=None,
+    base_final_score=None,
+    source_repeat_penalty=None,
+):
     log_data = load_log()
     log_entry = {
         "time": datetime.now(timezone.utc).isoformat(),
@@ -781,6 +795,8 @@ def log_news_check(title, url, pre_score, ai_score, topic, source, published=Fal
         "pre_score": pre_score,
         "ai_score": ai_score,
         "scale_score": scale_score,
+        "base_final_score": base_final_score,
+        "source_repeat_penalty": source_repeat_penalty,
         "final_score": final_score,
         "topic": topic,
         "source": source,
@@ -828,13 +844,13 @@ def format_run_report(stats: dict) -> str:
     )
 
 
-def save_and_notify_run_report(stats: dict):
+def save_and_notify_run_report(stats: dict, notify_admin_enabled: bool = True):
     try:
         log_run_summary(stats)
     except Exception as e:
         print(f"⚠️ Не удалось записать run summary: {str(e)[:120]}")
 
-    if SEND_RUN_REPORT_TO_ADMIN:
+    if SEND_RUN_REPORT_TO_ADMIN and notify_admin_enabled:
         notify_admin(safe_html_text(format_run_report(stats)))
 
 
@@ -871,9 +887,16 @@ def notify_admin(message: str):
 # =========================================================
 # ЗАГРУЗКА МОДЕЛИ ЭМБЕДДИНГОВ
 # =========================================================
-print("Загрузка модели для семантической дедупликации...")
-SEMANTIC_MODEL = SentenceTransformer(SEMANTIC_MODEL_NAME)
-print("Модель загружена.\n")
+SEMANTIC_MODEL = None
+
+
+def get_semantic_model():
+    global SEMANTIC_MODEL
+    if SEMANTIC_MODEL is None:
+        print("Загрузка модели для семантической дедупликации...")
+        SEMANTIC_MODEL = SentenceTransformer(SEMANTIC_MODEL_NAME)
+        print("Модель загружена.\n")
+    return SEMANTIC_MODEL
 
 
 # =========================================================
@@ -1089,6 +1112,30 @@ def fetch_all_news():
         else:
             print(f"  ✗ {source_name} -> нет данных")
     return all_news
+
+
+def check_feeds():
+    print("🔎 Проверка RSS/Atom источников")
+    print("=" * 60)
+
+    total = 0
+    failed = 0
+
+    for source in RSS_SOURCES:
+        source_name = source.get("name", source) if isinstance(source, dict) else source
+        news = fetch_rss(source)
+        count = len(news)
+        total += count
+        if count:
+            latest = news[0]
+            print(f"✓ {source_name}: {count} — {latest.get('title', '')[:90]}")
+        else:
+            failed += 1
+            print(f"✗ {source_name}: 0")
+
+    print("=" * 60)
+    print(f"Итого материалов: {total}, пустых/ошибочных источников: {failed}")
+    return failed == 0
 
 
 # =========================================================
@@ -1347,6 +1394,7 @@ def apply_final_score(candidate: dict) -> dict:
     final_score = (score * 0.65 + scale_score * 0.35) * topic_weight * source_weight
 
     candidate["topic"] = topic
+    candidate["base_final_score"] = round(final_score, 2)
     candidate["final_score"] = round(final_score, 2)
     return candidate
 
@@ -1627,7 +1675,8 @@ def make_news_text(title: str, summary: str) -> str:
 
 
 def get_embedding_as_list(text: str):
-    emb = SEMANTIC_MODEL.encode(
+    model = get_semantic_model()
+    emb = model.encode(
         text,
         convert_to_tensor=False,
         normalize_embeddings=True,
@@ -1764,9 +1813,20 @@ def send_to_telegram(text: str, chat_id: str):
 # =========================================================
 # ОСНОВНАЯ ЛОГИКА
 # =========================================================
-def main():
+def main(dry_run: bool = False):
     print("🚀 Science Agent")
+    if dry_run:
+        print("DRY RUN: Telegram и запись в posted_news.json отключены")
     print("=" * 60)
+
+    def maybe_notify_admin(message: str):
+        if dry_run:
+            print("🧪 DRY RUN: уведомление админу пропущено")
+            return False
+        return notify_admin(message)
+
+    def save_run_report():
+        return save_and_notify_run_report(stats, notify_admin_enabled=not dry_run)
 
     lock = FileLock(LOCK_FILE)
     lock.acquire()
@@ -1890,7 +1950,7 @@ def main():
 
         if not fresh_news:
             print("\n⚠️ Нет новых новостей")
-            save_and_notify_run_report(stats)
+            save_run_report()
             return
 
         print("\n⚙️ Предварительный отбор без AI...")
@@ -1963,6 +2023,8 @@ def main():
                         item["title"], item["link"], pre_score_val, ai_score,
                         candidate["topic"], source_for_log, published=False,
                         error=f"low_score_{ai_score}", scale_score=scale_score,
+                        base_final_score=candidate.get("base_final_score"),
+                        source_repeat_penalty=candidate.get("source_repeat_penalty"),
                         final_score=candidate["final_score"],
                     )
                     continue
@@ -1970,7 +2032,10 @@ def main():
                 log_news_check(
                     item["title"], item["link"], pre_score_val, ai_score,
                     candidate["topic"], source_for_log, published=False, error=None,
-                    scale_score=scale_score, final_score=candidate["final_score"],
+                    scale_score=scale_score,
+                    base_final_score=candidate.get("base_final_score"),
+                    source_repeat_penalty=candidate.get("source_repeat_penalty"),
+                    final_score=candidate["final_score"],
                 )
 
                 scored_news.append(candidate)
@@ -1978,8 +2043,8 @@ def main():
         if not scored_news:
             print(f"\n⚠️ Ни одна новость не прошла фильтр (минимум {MIN_SCORE})")
             stats["passed_ai"] = 0
-            save_and_notify_run_report(stats)
-            notify_admin(
+            save_run_report()
+            maybe_notify_admin(
                 f"Ни одна новость не прошла фильтр (минимум {MIN_SCORE}). "
                 f"Проверено: {len(fresh_news)}"
             )
@@ -1994,6 +2059,11 @@ def main():
             apply_source_repeat_penalty(candidate, posted_news_for_streak)
             if candidate.get("source_repeat_penalty", 1.0) < 1.0:
                 source_repeat_penalized += 1
+                print(
+                    f"   ↘ Повтор источника: {get_source_name(candidate['item'])}, "
+                    f"final {candidate.get('base_final_score')} -> {candidate.get('final_score')} "
+                    f"(x{candidate.get('source_repeat_penalty')})"
+                )
 
         stats["source_repeat_penalized"] = source_repeat_penalized
         scored_news.sort(key=lambda x: (x.get("final_score", 0), x.get("score", 0), x.get("pre_score", 0)), reverse=True)
@@ -2067,7 +2137,7 @@ def main():
                     error="rewrite_failed_or_refused", scale_score=candidate.get("scale_score"),
                     final_score=candidate.get("final_score"),
                 )
-                notify_admin(
+                maybe_notify_admin(
                     f"Модель отказалась переписывать новость:\n"
                     f"{safe_html_text(item['title'][:120])}\n\n"
                     f"Ответ модели:\n{safe_html_text((rewritten or 'None')[:300])}"
@@ -2093,6 +2163,13 @@ def main():
             print(preview)
             print("-" * 50)
 
+            if dry_run:
+                print("\n🧪 DRY RUN: публикация в Telegram и запись в базу пропущены")
+                published_count += 1
+                stats["published"] += 1
+                posted_news_for_streak.append({"topic": candidate["topic"], "source": source_for_log})
+                continue
+
             print("\n📤 Публикация в Telegram...")
             if send_to_telegram(final_text, CHANNEL_ID):
                 mark_posted(
@@ -2106,7 +2183,10 @@ def main():
                 log_news_check(
                     item["title"], item["link"], candidate["pre_score"], candidate["score"],
                     candidate["topic"], source_for_log, published=True, error=None,
-                    scale_score=candidate.get("scale_score"), final_score=candidate.get("final_score"),
+                    scale_score=candidate.get("scale_score"),
+                    base_final_score=candidate.get("base_final_score"),
+                    source_repeat_penalty=candidate.get("source_repeat_penalty"),
+                    final_score=candidate.get("final_score"),
                 )
                 print("   ✅ Опубликовано и записано в базу")
                 published_count += 1
@@ -2119,9 +2199,11 @@ def main():
                     item["title"], item["link"], candidate["pre_score"], candidate["score"],
                     candidate["topic"], source_for_log, published=False,
                     error="telegram_send_failed", scale_score=candidate.get("scale_score"),
+                    base_final_score=candidate.get("base_final_score"),
+                    source_repeat_penalty=candidate.get("source_repeat_penalty"),
                     final_score=candidate.get("final_score"),
                 )
-                notify_admin(f"Ошибка отправки в Telegram: {safe_html_text(item['title'][:120])}")
+                maybe_notify_admin(f"Ошибка отправки в Telegram: {safe_html_text(item['title'][:120])}")
 
         if published_count == 0 and skipped_due_topic_streak:
             print("\n⚠️ Кандидаты после лимитов не опубликованы. Пробую fallback из резервных кандидатов.")
@@ -2154,6 +2236,13 @@ def main():
                     stats["rewrite_failed"] += 1
                     continue
 
+                if dry_run:
+                    print("\n🧪 DRY RUN: fallback-публикация в Telegram и запись в базу пропущены")
+                    stats["published"] += 1
+                    published_count += 1
+                    posted_news_for_streak.append({"topic": candidate["topic"], "source": source_for_log})
+                    continue
+
                 print("\n📤 Публикация fallback в Telegram...")
                 if send_to_telegram(final_text, CHANNEL_ID):
                     mark_posted(
@@ -2166,23 +2255,29 @@ def main():
                     log_news_check(
                         item["title"], item["link"], candidate["pre_score"], candidate["score"],
                         candidate["topic"], source_for_log, published=True, error="topic_streak_fallback",
-                        scale_score=candidate.get("scale_score"), final_score=candidate.get("final_score"),
+                        scale_score=candidate.get("scale_score"),
+                        base_final_score=candidate.get("base_final_score"),
+                        source_repeat_penalty=candidate.get("source_repeat_penalty"),
+                        final_score=candidate.get("final_score"),
                     )
                 else:
                     stats["telegram_failed"] += 1
                     log_news_check(
                         item["title"], item["link"], candidate["pre_score"], candidate["score"],
                         candidate["topic"], source_for_log, published=False, error="telegram_send_failed",
-                        scale_score=candidate.get("scale_score"), final_score=candidate.get("final_score"),
+                        scale_score=candidate.get("scale_score"),
+                        base_final_score=candidate.get("base_final_score"),
+                        source_repeat_penalty=candidate.get("source_repeat_penalty"),
+                        final_score=candidate.get("final_score"),
                     )
 
         if published_count == 0:
             print("\n⚠️ Не удалось опубликовать ни одну новость")
-            save_and_notify_run_report(stats)
-            notify_admin(f"Не удалось опубликовать ни одну из {len(scored_news)} новостей. Проверь логи.")
+            save_run_report()
+            maybe_notify_admin(f"Не удалось опубликовать ни одну из {len(scored_news)} новостей. Проверь логи.")
             return
 
-        save_and_notify_run_report(stats)
+        save_run_report()
 
         print("\n" + "=" * 60)
         print(f"🏁 Готово! Проверено: {len(fresh_news)}, Подходящих: {len(scored_news)}, Опубликовано: {published_count}")
@@ -2191,11 +2286,28 @@ def main():
     except Exception as e:
         error_msg = f"Критическая ошибка: {str(e)}\n\n{traceback.format_exc()[:1000]}"
         print(f"\n💥 {error_msg}")
-        notify_admin(safe_html_text(error_msg))
+        maybe_notify_admin(safe_html_text(error_msg))
         raise
     finally:
         lock.release()
 
 
+def cli():
+    args = set(sys.argv[1:])
+    allowed_args = {"--dry-run", "--check-feeds"}
+    unknown_args = args - allowed_args
+
+    if unknown_args:
+        print(f"Неизвестные аргументы: {', '.join(sorted(unknown_args))}")
+        print("Доступно: --dry-run, --check-feeds")
+        return 2
+
+    if "--check-feeds" in args:
+        return 0 if check_feeds() else 1
+
+    main(dry_run="--dry-run" in args)
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(cli())
