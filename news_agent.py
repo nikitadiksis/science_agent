@@ -69,7 +69,8 @@ SEND_RUN_REPORT_TO_ADMIN = True
 # Редакционные ограничения
 MAX_CONSECUTIVE_SAME_TOPIC = 2
 SOURCE_REPEAT_LOOKBACK = 3
-MAX_SAME_SOURCE_IN_LOOKBACK = 1
+SAME_SOURCE_LAST_POST_PENALTY = 0.88
+SAME_SOURCE_RECENT_PENALTY = 0.94
 DEFAULT_SOURCE_LIMIT_FOR_AI = 4
 SOURCE_LIMITS_FOR_AI = {
     "Medical Xpress": 1,
@@ -807,7 +808,7 @@ def format_run_report(stats: dict) -> str:
         f"Прошли AI-фильтр: {stats.get('passed_ai', 0)}\n"
         f"Низкий AI-score: {stats.get('low_score', 0)}\n"
         f"Срезано лимитом тем: {stats.get('topic_streak_skipped', 0)}\n"
-        f"Срезано лимитом источников: {stats.get('source_streak_skipped', 0)}\n"
+        f"Штраф за повтор источника: {stats.get('source_repeat_penalized', 0)}\n"
         f"Ошибки rewrite: {stats.get('rewrite_failed', 0)}\n"
         f"Ошибки Telegram: {stats.get('telegram_failed', 0)}\n"
         f"Опубликовано: {stats.get('published', 0)}"
@@ -1335,14 +1336,9 @@ def violates_topic_streak(candidate_topic: str, posted_news: list, max_streak=MA
     return streak >= max_streak
 
 
-def violates_source_repeat(
-    candidate_source: str,
-    posted_news: list,
-    lookback=SOURCE_REPEAT_LOOKBACK,
-    max_same_source=MAX_SAME_SOURCE_IN_LOOKBACK,
-) -> bool:
+def source_repeat_penalty(candidate_source: str, posted_news: list, lookback=SOURCE_REPEAT_LOOKBACK) -> float:
     if not candidate_source:
-        return False
+        return 1.0
 
     recent_sources = []
     for item in reversed(posted_news):
@@ -1354,12 +1350,26 @@ def violates_source_repeat(
             break
 
     if not recent_sources:
-        return False
+        return 1.0
 
     if recent_sources[0] == candidate_source:
-        return True
+        return SAME_SOURCE_LAST_POST_PENALTY
 
-    return recent_sources.count(candidate_source) >= max_same_source
+    if candidate_source in recent_sources:
+        return SAME_SOURCE_RECENT_PENALTY
+
+    return 1.0
+
+
+def apply_source_repeat_penalty(candidate: dict, posted_news: list) -> dict:
+    candidate_source = get_source_name(candidate.get("item", {}))
+    penalty = source_repeat_penalty(candidate_source, posted_news)
+
+    candidate["source_repeat_penalty"] = penalty
+    if penalty < 1.0:
+        candidate["final_score"] = round(float(candidate.get("final_score", 0)) * penalty, 2)
+
+    return candidate
 
 
 # =========================================================
@@ -1738,7 +1748,7 @@ def main():
         "passed_ai": 0,
         "low_score": 0,
         "topic_streak_skipped": 0,
-        "source_streak_skipped": 0,
+        "source_repeat_penalized": 0,
         "rewrite_failed": 0,
         "telegram_failed": 0,
         "published": 0,
@@ -1939,13 +1949,19 @@ def main():
             )
             return
 
-        scored_news.sort(key=lambda x: (x.get("final_score", 0), x.get("score", 0), x.get("pre_score", 0)), reverse=True)
-        stats["passed_ai"] = len(scored_news)
-
         published_count = 0
         skipped_due_topic_streak = []
-        skipped_due_source_streak = []
         posted_news_for_streak = load_db().get("posted", [])
+        source_repeat_penalized = 0
+
+        for candidate in scored_news:
+            apply_source_repeat_penalty(candidate, posted_news_for_streak)
+            if candidate.get("source_repeat_penalty", 1.0) < 1.0:
+                source_repeat_penalized += 1
+
+        stats["source_repeat_penalized"] = source_repeat_penalized
+        scored_news.sort(key=lambda x: (x.get("final_score", 0), x.get("score", 0), x.get("pre_score", 0)), reverse=True)
+        stats["passed_ai"] = len(scored_news)
 
         # Сначала пробуем новости, которые не станут третьими подряд на одну тему.
         # Если таких нет вообще — fallback ниже позволит не получить пустой запуск.
@@ -1964,24 +1980,6 @@ def main():
         else:
             ordered_candidates = scored_news
             print("   ⚠️ Все подходящие новости нарушают лимит темы, включён fallback")
-
-        source_allowed_candidates = []
-        source_blocked_candidates = []
-        for candidate in ordered_candidates:
-            candidate_source = get_source_name(candidate["item"])
-            if violates_source_repeat(candidate_source, posted_news_for_streak):
-                source_blocked_candidates.append(candidate)
-            else:
-                source_allowed_candidates.append(candidate)
-
-        if source_allowed_candidates:
-            ordered_candidates = source_allowed_candidates
-            stats["source_streak_skipped"] = len(source_blocked_candidates)
-            skipped_due_source_streak = source_blocked_candidates
-        else:
-            stats["source_streak_skipped"] = len(source_blocked_candidates)
-            skipped_due_source_streak = source_blocked_candidates
-            print("   ⚠️ Все подходящие новости нарушают лимит источника, включён fallback")
 
         for candidate in ordered_candidates:
             if published_count >= POSTS_PER_RUN:
@@ -2088,9 +2086,6 @@ def main():
                     final_score=candidate.get("final_score"),
                 )
                 notify_admin(f"Ошибка отправки в Telegram: {safe_html_text(item['title'][:120])}")
-
-        if published_count == 0 and skipped_due_source_streak:
-            skipped_due_topic_streak = skipped_due_source_streak + skipped_due_topic_streak
 
         if published_count == 0 and skipped_due_topic_streak:
             print("\n⚠️ Кандидаты после лимитов не опубликованы. Пробую fallback из резервных кандидатов.")
