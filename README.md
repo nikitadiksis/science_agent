@@ -3,7 +3,6 @@
 👉 https://t.me/kanalnieuslugi
 
 # 🧠 Science News Agent (Telegram)
-![Uploading image.png…]()
 
 Автоматизированная система сбора, анализа и публикации новостей о науке и технологиях в Telegram-канал.
 
