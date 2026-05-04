@@ -106,4 +106,4 @@ pip install -r requirements.txt
 
 При необходимости ручного запуска:
 
-python science_agent_improved.py
+python news_agent.py
