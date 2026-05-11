@@ -86,6 +86,13 @@ class NewsAgentPureTests(unittest.TestCase):
         self.assertIn("&lt;x&gt;", post)
         self.assertEqual(post.count("<a href="), 1)
 
+    def test_build_rewrite_prompt_requires_company_context_and_flexible_format(self):
+        prompt = news_agent.build_rewrite_prompt("Ramp raises funding", "Ramp is a fintech company.")
+        self.assertIn("не загоняй каждую новость в буллеты", prompt.lower())
+        self.assertIn("обязательно добавь это в начале текста одной короткой фразой", prompt.lower())
+        self.assertIn("короткий абзац на 2–4 предложения", prompt)
+        self.assertIn("смешанный формат", prompt.lower())
+
 
 if __name__ == "__main__":
     unittest.main()
