@@ -107,3 +107,9 @@ pip install -r requirements.txt
 При необходимости ручного запуска:
 
 python news_agent.py
+
+---
+
+## Editorial Notes
+
+See `EDITORIAL_GUIDELINES.md` for the rules around company context, when to use bullets, and when a short paragraph or mixed format is better for a news post.
