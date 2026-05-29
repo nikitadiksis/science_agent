@@ -10,7 +10,7 @@ import tempfile
 import traceback
 from html import unescape, escape
 from datetime import datetime, timezone
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse, urljoin
 from email.utils import parsedate_to_datetime
 from collections import defaultdict
 
@@ -34,6 +34,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY")
+MAX_BOT_TOKEN = os.getenv("MAX_BOT_TOKEN")
+MAX_CHAT_ID = os.getenv("MAX_CHAT_ID")
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Не задан TELEGRAM_TOKEN")
@@ -59,16 +61,20 @@ DEDUP_LOOKBACK = 80
 SIMILARITY_THRESHOLD = 0.78
 
 REQUEST_TIMEOUT_RSS = 15
+REQUEST_TIMEOUT_SOURCE_PAGE = 15
 REQUEST_TIMEOUT_AI = 40
 REQUEST_TIMEOUT_TELEGRAM = (10, 30)  # 10 сек подключение, 30 сек ответ
 TELEGRAM_MAX_ATTEMPTS = 2
 TELEGRAM_RETRY_SLEEP_SECONDS = 3
 TELEGRAM_MESSAGE_LIMIT = 4096
 TELEGRAM_MESSAGE_SAFE_LIMIT = 3900
+TELEGRAM_CAPTION_LIMIT = 1024
+TELEGRAM_CAPTION_SAFE_LIMIT = 1000
 TELEGRAM_HASHTAGS = "#science #news"
 
 MAX_RSS_ITEMS_PER_FEED = 10
 MAX_RSS_RESPONSE_BYTES = 2_000_000
+MAX_SOURCE_PAGE_BYTES = 600_000
 MAX_SUMMARY_CHARS_FROM_FEED = 700
 MAX_LOG_RECORDS = 500
 MAX_RUN_LOG_RECORDS = 100
@@ -638,6 +644,64 @@ def fix_english_words(text: str) -> str:
     return text
 
 
+def cleanup_rewrite_output(text: str) -> str:
+    if not text:
+        return ""
+
+    text = text.strip()
+    lines = [line.rstrip() for line in text.splitlines()]
+
+    artifact_patterns = [
+        r"(?i)^\s*human\s*:",
+        r"(?i)^\s*assistant\s*:",
+        r"(?i)^\s*user\s*:",
+        r"(?i)^\s*вот\s+исправ",
+        r"(?i)^\s*исправленн",
+        r"(?i)^\s*корректн\w*\s+вариант",
+        r"(?i)^\s*отличное\s+замеч",
+        r"(?i)^\s*хорошо[,!\s]",
+    ]
+
+    cleaned = []
+    for line in lines:
+        if any(re.search(pattern, line) for pattern in artifact_patterns):
+            continue
+        cleaned.append(line)
+
+    text = "\n".join(cleaned).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
+def has_bad_rewrite_artifacts(text: str) -> bool:
+    if not text:
+        return True
+
+    lowered = text.lower()
+    bad_markers = [
+        "human:",
+        "assistant:",
+        "user:",
+        "вот исправ",
+        "исправленный вариант",
+        "исправленный текст",
+        "корректный вариант",
+        "отличное замеч",
+    ]
+    if any(marker in lowered for marker in bad_markers):
+        return True
+
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return True
+
+    bullet_count = sum(1 for line in lines if line.startswith(("•", "-", "*")))
+    if len(lines) >= 6 and bullet_count == 0:
+        return True
+
+    return False
+
+
 def is_safe_url(url: str) -> bool:
     try:
         if not url:
@@ -845,7 +909,10 @@ def format_run_report(stats: dict) -> str:
         f"Штраф за повтор источника: {stats.get('source_repeat_penalized', 0)}\n"
         f"Ошибки rewrite: {stats.get('rewrite_failed', 0)}\n"
         f"Ошибки Telegram: {stats.get('telegram_failed', 0)}\n"
-        f"Опубликовано: {stats.get('published', 0)}"
+        f"Ошибки MAX: {stats.get('max_failed', 0)}\n"
+        f"Опубликовано новостей: {stats.get('published', 0)} | "
+        f"в Telegram: {stats.get('published_telegram', 0)} | "
+        f"в MAX: {stats.get('published_max', 0)}"
     )
 
 
@@ -955,6 +1022,101 @@ def build_telegram_post(rewritten_plain: str, source_url: str) -> str:
         parts.append(source_part)
 
     return "\n".join(parts).strip()
+
+
+def extract_image_url_from_html(html: str, page_url: str) -> str:
+    if not html:
+        return ""
+
+    meta_patterns = [
+        r'<meta[^>]+property=["\']og:image(?::url)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+name=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image(?::url)?["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image(?::src)?["\']',
+        r'<link[^>]+rel=["\']image_src["\'][^>]+href=["\']([^"\']+)["\']',
+    ]
+
+    for pattern in meta_patterns:
+        match = re.search(pattern, html, flags=re.IGNORECASE)
+        if not match:
+            continue
+
+        candidate = unescape((match.group(1) or "").strip())
+        if not candidate:
+            continue
+
+        resolved = normalize_url(urljoin(page_url, candidate))
+        if not is_safe_url(resolved):
+            continue
+
+        lowered = resolved.lower()
+        if lowered.endswith(".svg") or ".svg?" in lowered:
+            continue
+
+        return resolved
+
+    return ""
+
+
+def fetch_source_image_url(source_url: str) -> str:
+    if not is_safe_url(source_url):
+        return ""
+
+    try:
+        response = session.get(source_url, timeout=REQUEST_TIMEOUT_SOURCE_PAGE, stream=True)
+        if response.status_code != 200:
+            return ""
+
+        content_type = (response.headers.get("Content-Type") or "").lower()
+        if "html" not in content_type:
+            return ""
+
+        chunks = []
+        total_size = 0
+
+        for chunk in response.iter_content(chunk_size=8192, decode_unicode=False):
+            if not chunk:
+                continue
+            total_size += len(chunk)
+            if total_size > MAX_SOURCE_PAGE_BYTES:
+                break
+            chunks.append(chunk)
+
+        html = b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
+        return extract_image_url_from_html(html, source_url)
+
+    except Exception:
+        return ""
+
+
+def should_attach_source_image(item: dict, topic: str = "") -> bool:
+    topic = (topic or item.get("topic") or item.get("default_topic") or "").strip().lower()
+    title = (item.get("title") or "").lower()
+    summary = (item.get("summary") or "").lower()
+    text = f"{title} {summary}"
+
+    visual_topics = {
+        "space",
+        "robotics",
+        "consumer_tech",
+        "semiconductors",
+        "science",
+    }
+    if topic in visual_topics:
+        return True
+
+    visual_markers = [
+        "photo", "image", "pictured", "picture", "render", "rendering",
+        "map", "mapped", "snapshot", "view", "visualization", "visualisation",
+        "telescope", "mars", "moon", "planet", "galaxy", "nebula",
+        "spacecraft", "satellite", "rover", "robot", "drone",
+        "prototype", "device", "gadget", "chip", "wafer", "microscope",
+        "camera", "sensor", "3d", "design", "model",
+        "снимок", "фото", "изображение", "кадр", "рендер", "визуализация",
+        "карта", "полюс", "марс", "луна", "планета", "телескоп",
+        "спутник", "ровер", "робот", "дрон", "прототип", "устройство", "чип",
+    ]
+    return any(marker in text for marker in visual_markers)
 
 
 # =========================================================
@@ -1687,7 +1849,21 @@ def rewrite_v2(title, summary):
     result = ai_chat(prompt, model=AI_MODEL_REWRITE, max_tokens=420)
     if result:
         result = re.sub(r"(?i)^(РІРѕС‚ РІРµСЂСЃРёСЏ|РІРѕС‚ С‚РµРєСЃС‚|version|РёС‚Р°Рє)\s*", "", result.strip())
+        result = cleanup_rewrite_output(result)
         result = fix_english_words(result)
+        if has_bad_rewrite_artifacts(result):
+            retry_prompt = (
+                build_rewrite_prompt(title, summary)
+                + "\n\nВерни только финальный текст поста."
+                + "\nБез комментариев, без объяснений, без вариантов, без самопроверки."
+                + "\nНельзя писать Human:, Assistant:, 'Вот исправленный вариант' или похожие фразы."
+            )
+            retry_result = ai_chat(retry_prompt, model=AI_MODEL_REWRITE, max_tokens=420)
+            if retry_result:
+                retry_result = cleanup_rewrite_output(retry_result)
+                retry_result = fix_english_words(retry_result)
+                if not has_bad_rewrite_artifacts(retry_result):
+                    result = retry_result
     return result
 
 
@@ -1845,7 +2021,68 @@ def is_semantic_duplicate_with_cache(news_embedding, cached_items, cached_embedd
 # =========================================================
 # TELEGRAM
 # =========================================================
+def send_to_telegram_v2(text: str, chat_id: str, image_url: str = ""):
+    final_text = text
+    if TELEGRAM_HASHTAGS not in final_text:
+        final_text = f"{final_text}\n\n{TELEGRAM_HASHTAGS}"
+
+    if len(final_text) > TELEGRAM_MESSAGE_LIMIT:
+        print(f"   вќЊ Telegram С‚РµРєСЃС‚ СЃР»РёС€РєРѕРј РґР»РёРЅРЅС‹Р№ РїРѕСЃР»Рµ Р±РµР·РѕРїР°СЃРЅРѕР№ СЃР±РѕСЂРєРё: {len(final_text)}")
+        return False
+
+    use_photo = bool(is_safe_url(image_url) and len(final_text) <= TELEGRAM_CAPTION_SAFE_LIMIT)
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{'sendPhoto' if use_photo else 'sendMessage'}"
+
+    for attempt in range(1, TELEGRAM_MAX_ATTEMPTS + 1):
+        try:
+            print(f"   рџ“¤ Telegram РїРѕРїС‹С‚РєР° {attempt}/{TELEGRAM_MAX_ATTEMPTS}")
+
+            payload = {
+                "chat_id": chat_id,
+                "parse_mode": "HTML",
+            }
+            if use_photo:
+                payload["photo"] = image_url
+                payload["caption"] = final_text
+            else:
+                payload["text"] = final_text
+                payload["disable_web_page_preview"] = False
+
+            response = session.post(
+                url,
+                json=payload,
+                timeout=REQUEST_TIMEOUT_TELEGRAM,
+            )
+
+            if response.status_code == 200:
+                print("   вњ… РћС‚РїСЂР°РІР»РµРЅРѕ РІ Telegram")
+                return True
+
+            print(f"   вќЊ РћС€РёР±РєР° Telegram {response.status_code}: {response.text[:250]}")
+
+        except requests.exceptions.Timeout:
+            print("   вЏ±пёЏ Telegram timeout: API РЅРµ РѕС‚РІРµС‚РёР» РІРѕРІСЂРµРјСЏ")
+        except requests.exceptions.ConnectionError:
+            print("   рџЊђ Telegram РЅРµРґРѕСЃС‚СѓРїРµРЅ: РїСЂРѕР±Р»РµРјР° СЃРµС‚Рё/VPN")
+        except requests.exceptions.RequestException as e:
+            print(f"   вќЊ РћС€РёР±РєР° РѕС‚РїСЂР°РІРєРё РІ Telegram: {str(e)[:150]}")
+        except Exception as e:
+            print(f"   вќЊ РќРµРѕР¶РёРґР°РЅРЅР°СЏ РѕС€РёР±РєР° Telegram: {str(e)[:150]}")
+
+        if attempt < TELEGRAM_MAX_ATTEMPTS:
+            try:
+                import time
+                time.sleep(TELEGRAM_RETRY_SLEEP_SECONDS)
+            except Exception:
+                pass
+
+    print(f"   вќЊ Telegram РЅРµ РѕС‚РїСЂР°РІР»РµРЅ РїРѕСЃР»Рµ {TELEGRAM_MAX_ATTEMPTS} РїРѕРїС‹С‚РѕРє")
+    return False
+
+
 def send_to_telegram(text: str, chat_id: str):
+    return send_to_telegram_v2(text, chat_id)
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
     final_text = text
@@ -1897,6 +2134,95 @@ def send_to_telegram(text: str, chat_id: str):
     return False
 
 
+def telegram_html_to_max_html(text: str) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+
+    # MAX supports HTML formatting too; keep the body and rely on plain links where needed.
+    return cleaned
+
+
+def send_to_max(text: str, chat_id: str) -> bool:
+    if not MAX_BOT_TOKEN or not chat_id:
+        return False
+
+    final_text = telegram_html_to_max_html(text)
+    if not final_text:
+        return False
+
+    if len(final_text) > 4000:
+        final_text = final_text[:3997].rstrip() + "..."
+
+    url = "https://platform-api.max.ru/messages"
+    headers = {
+        "Authorization": MAX_BOT_TOKEN,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "text": final_text,
+        "format": "html",
+        "notify": True,
+    }
+
+    params = {
+        "chat_id": str(chat_id),
+        "disable_link_preview": "false",
+    }
+
+    for attempt in range(1, TELEGRAM_MAX_ATTEMPTS + 1):
+        try:
+            print(f"   MAX attempt {attempt}/{TELEGRAM_MAX_ATTEMPTS}")
+            response = session.post(
+                url,
+                params=params,
+                headers=headers,
+                json=payload,
+                timeout=REQUEST_TIMEOUT_TELEGRAM,
+            )
+
+            if response.status_code in (200, 201):
+                print("   MAX sent")
+                return True
+
+            print(f"   MAX error {response.status_code}: {response.text[:250]}")
+
+        except requests.exceptions.Timeout:
+            print("   MAX timeout")
+        except requests.exceptions.ConnectionError:
+            print("   MAX connection error")
+        except requests.exceptions.RequestException as e:
+            print(f"   MAX request error: {str(e)[:150]}")
+        except Exception as e:
+            print(f"   MAX unexpected error: {str(e)[:150]}")
+
+        if attempt < TELEGRAM_MAX_ATTEMPTS:
+            try:
+                import time
+                time.sleep(TELEGRAM_RETRY_SLEEP_SECONDS)
+            except Exception:
+                pass
+
+    print(f"   MAX not sent after {TELEGRAM_MAX_ATTEMPTS} attempts")
+    return False
+
+
+def publish_to_platforms(text: str, image_url: str = "") -> dict:
+    results = {
+        "telegram": False,
+        "max": False,
+    }
+
+    if TELEGRAM_TOKEN and CHANNEL_ID:
+        results["telegram"] = send_to_telegram_v2(text, CHANNEL_ID, image_url=image_url)
+
+    if MAX_BOT_TOKEN and MAX_CHAT_ID:
+        results["max"] = send_to_max(text, MAX_CHAT_ID)
+
+    results["any_success"] = any(results.values())
+    return results
+
+
 # =========================================================
 # ОСНОВНАЯ ЛОГИКА
 # =========================================================
@@ -1934,7 +2260,10 @@ def main(dry_run: bool = False):
         "source_repeat_penalized": 0,
         "rewrite_failed": 0,
         "telegram_failed": 0,
+        "max_failed": 0,
         "published": 0,
+        "published_telegram": 0,
+        "published_max": 0,
     }
 
     try:
@@ -2250,6 +2579,12 @@ def main(dry_run: bool = False):
             print(preview)
             print("-" * 50)
 
+            image_url = ""
+            if should_attach_source_image(item, candidate.get("topic")):
+                image_url = fetch_source_image_url(item["link"])
+            if image_url:
+                print(f"   Image found: {image_url[:160]}")
+
             if dry_run:
                 print("\n🧪 DRY RUN: публикация в Telegram и запись в базу пропущены")
                 published_count += 1
@@ -2257,8 +2592,18 @@ def main(dry_run: bool = False):
                 posted_news_for_streak.append({"topic": candidate["topic"], "source": source_for_log})
                 continue
 
-            print("\n📤 Публикация в Telegram...")
-            if send_to_telegram(final_text, CHANNEL_ID):
+            print("\n📤 Публикация в платформы...")
+            publish_results = publish_to_platforms(final_text, image_url=image_url)
+            if publish_results.get("telegram") is False and TELEGRAM_TOKEN and CHANNEL_ID:
+                stats["telegram_failed"] += 1
+            if publish_results.get("max") is False and MAX_BOT_TOKEN and MAX_CHAT_ID:
+                stats["max_failed"] += 1
+            if publish_results.get("telegram"):
+                stats["published_telegram"] += 1
+            if publish_results.get("max"):
+                stats["published_max"] += 1
+
+            if publish_results.get("any_success"):
                 mark_posted(
                     item["link"],
                     item["title"],
@@ -2275,12 +2620,11 @@ def main(dry_run: bool = False):
                     source_repeat_penalty=candidate.get("source_repeat_penalty"),
                     final_score=candidate.get("final_score"),
                 )
-                print("   ✅ Опубликовано и записано в базу")
+                print("   ✅ Опубликовано хотя бы в одну платформу и записано в базу")
                 published_count += 1
                 stats["published"] += 1
                 posted_news_for_streak.append({"topic": candidate["topic"], "source": source_for_log})
             else:
-                stats["telegram_failed"] += 1
                 print("   ❌ Публикация не удалась. Новость НЕ записана в posted_news.json")
                 log_news_check(
                     item["title"], item["link"], candidate["pre_score"], candidate["score"],
@@ -2323,6 +2667,12 @@ def main(dry_run: bool = False):
                     stats["rewrite_failed"] += 1
                     continue
 
+                image_url = ""
+                if should_attach_source_image(item, candidate.get("topic")):
+                    image_url = fetch_source_image_url(item["link"])
+                if image_url:
+                    print(f"   Fallback image found: {image_url[:160]}")
+
                 if dry_run:
                     print("\n🧪 DRY RUN: fallback-публикация в Telegram и запись в базу пропущены")
                     stats["published"] += 1
@@ -2330,8 +2680,18 @@ def main(dry_run: bool = False):
                     posted_news_for_streak.append({"topic": candidate["topic"], "source": source_for_log})
                     continue
 
-                print("\n📤 Публикация fallback в Telegram...")
-                if send_to_telegram(final_text, CHANNEL_ID):
+                print("\n📤 Публикация fallback в платформы...")
+                publish_results = publish_to_platforms(final_text, image_url=image_url)
+                if publish_results.get("telegram") is False and TELEGRAM_TOKEN and CHANNEL_ID:
+                    stats["telegram_failed"] += 1
+                if publish_results.get("max") is False and MAX_BOT_TOKEN and MAX_CHAT_ID:
+                    stats["max_failed"] += 1
+                if publish_results.get("telegram"):
+                    stats["published_telegram"] += 1
+                if publish_results.get("max"):
+                    stats["published_max"] += 1
+
+                if publish_results.get("any_success"):
                     mark_posted(
                         item["link"], item["title"], item.get("summary", ""),
                         embedding=item.get("embedding"), topic=candidate["topic"], source=source_for_log,
@@ -2348,7 +2708,6 @@ def main(dry_run: bool = False):
                         final_score=candidate.get("final_score"),
                     )
                 else:
-                    stats["telegram_failed"] += 1
                     log_news_check(
                         item["title"], item["link"], candidate["pre_score"], candidate["score"],
                         candidate["topic"], source_for_log, published=False, error="telegram_send_failed",

@@ -94,5 +94,129 @@ class NewsAgentPureTests(unittest.TestCase):
         self.assertIn("смешанный формат", prompt.lower())
 
 
+    def test_extract_image_url_from_html_prefers_og_image(self):
+        html = """
+        <html>
+          <head>
+            <meta property="og:image" content="/images/mars.jpg?utm_source=site" />
+          </head>
+        </html>
+        """
+        image_url = news_agent.extract_image_url_from_html(html, "https://science.nasa.gov/photojournal/story")
+        self.assertEqual(image_url, "https://science.nasa.gov/images/mars.jpg")
+
+    def test_send_to_telegram_uses_send_photo_for_short_caption(self):
+        calls = []
+
+        class FakeResponse:
+            status_code = 200
+            text = "ok"
+
+        def fake_post(url, json=None, timeout=None):
+            calls.append((url, json, timeout))
+            return FakeResponse()
+
+        old_session = news_agent.session
+        news_agent.session = types.SimpleNamespace(post=fake_post)
+        try:
+            ok = news_agent.send_to_telegram_v2("Short post", "chat-id", image_url="https://example.com/image.jpg")
+        finally:
+            news_agent.session = old_session
+
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("/sendPhoto", calls[0][0])
+        self.assertEqual(calls[0][1]["photo"], "https://example.com/image.jpg")
+        self.assertIn("caption", calls[0][1])
+
+    def test_should_attach_source_image_for_visual_space_news(self):
+        item = {
+            "title": "Psyche captured a high-resolution image of Mars south pole",
+            "summary": "The snapshot shows the polar cap in detail.",
+        }
+        self.assertTrue(news_agent.should_attach_source_image(item, topic="space"))
+
+    def test_should_not_attach_source_image_for_plain_funding_news(self):
+        item = {
+            "title": "Ramp raises $750M at a $40B valuation",
+            "summary": "The fintech company is in talks for a new funding round.",
+        }
+        self.assertFalse(news_agent.should_attach_source_image(item, topic="business_tech"))
+
+    def test_send_to_max_posts_html_message(self):
+        calls = []
+
+        class FakeResponse:
+            status_code = 200
+            text = "ok"
+
+        def fake_post(url, params=None, headers=None, json=None, timeout=None):
+            calls.append((url, params, headers, json, timeout))
+            return FakeResponse()
+
+        old_session = news_agent.session
+        old_token = news_agent.MAX_BOT_TOKEN
+        news_agent.session = types.SimpleNamespace(post=fake_post)
+        news_agent.MAX_BOT_TOKEN = "max-token"
+        try:
+            ok = news_agent.send_to_max("<b>Hello</b>", "-123")
+        finally:
+            news_agent.session = old_session
+            news_agent.MAX_BOT_TOKEN = old_token
+
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "https://platform-api.max.ru/messages")
+        self.assertEqual(calls[0][1]["chat_id"], "-123")
+        self.assertEqual(calls[0][3]["format"], "html")
+
+    def test_publish_to_platforms_succeeds_if_one_platform_succeeds(self):
+        old_send_tg = news_agent.send_to_telegram_v2
+        old_send_max = news_agent.send_to_max
+        old_tg_token = news_agent.TELEGRAM_TOKEN
+        old_channel = news_agent.CHANNEL_ID
+        old_max_token = news_agent.MAX_BOT_TOKEN
+        old_max_chat = news_agent.MAX_CHAT_ID
+
+        news_agent.send_to_telegram_v2 = lambda text, chat_id, image_url="": False
+        news_agent.send_to_max = lambda text, chat_id: True
+        news_agent.TELEGRAM_TOKEN = "tg"
+        news_agent.CHANNEL_ID = "channel"
+        news_agent.MAX_BOT_TOKEN = "max"
+        news_agent.MAX_CHAT_ID = "-1"
+        try:
+            result = news_agent.publish_to_platforms("post text")
+        finally:
+            news_agent.send_to_telegram_v2 = old_send_tg
+            news_agent.send_to_max = old_send_max
+            news_agent.TELEGRAM_TOKEN = old_tg_token
+            news_agent.CHANNEL_ID = old_channel
+            news_agent.MAX_BOT_TOKEN = old_max_token
+            news_agent.MAX_CHAT_ID = old_max_chat
+
+        self.assertFalse(result["telegram"])
+        self.assertTrue(result["max"])
+        self.assertTrue(result["any_success"])
+
+    def test_format_run_report_includes_platform_publish_counts(self):
+        report = news_agent.format_run_report({
+            "published": 1,
+            "published_telegram": 1,
+            "published_max": 1,
+        })
+        self.assertIn("Опубликовано новостей: 1", report)
+        self.assertIn("в Telegram: 1", report)
+        self.assertIn("в MAX: 1", report)
+
+    def test_cleanup_rewrite_output_removes_editorial_chatter(self):
+        raw = "Human: хорошо\nВот исправленный вариант:\nTitle\n\n• fact"
+        cleaned = news_agent.cleanup_rewrite_output(raw)
+        self.assertEqual(cleaned, "Title\n\n• fact")
+
+    def test_has_bad_rewrite_artifacts_detects_dialogue_markers(self):
+        self.assertTrue(news_agent.has_bad_rewrite_artifacts("Human: fix this"))
+        self.assertFalse(news_agent.has_bad_rewrite_artifacts("Title\n\n• fact one\n• fact two\n• fact three"))
+
+
 if __name__ == "__main__":
     unittest.main()
