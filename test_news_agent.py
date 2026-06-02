@@ -170,6 +170,34 @@ class NewsAgentPureTests(unittest.TestCase):
         self.assertEqual(calls[0][1]["chat_id"], "-123")
         self.assertEqual(calls[0][3]["format"], "html")
 
+    def test_send_to_max_adds_image_attachment_when_upload_succeeds(self):
+        calls = []
+
+        class FakeResponse:
+            status_code = 200
+            text = "ok"
+
+        def fake_post(url, params=None, headers=None, json=None, timeout=None):
+            calls.append((url, params, headers, json, timeout))
+            return FakeResponse()
+
+        old_session = news_agent.session
+        old_token = news_agent.MAX_BOT_TOKEN
+        old_upload = news_agent.upload_image_to_max
+        news_agent.session = types.SimpleNamespace(post=fake_post)
+        news_agent.MAX_BOT_TOKEN = "max-token"
+        news_agent.upload_image_to_max = lambda image_url: {"type": "image", "payload": {"token": "img-token"}}
+        try:
+            ok = news_agent.send_to_max("<b>Hello</b>", "-123", image_url="https://example.com/image.jpg")
+        finally:
+            news_agent.session = old_session
+            news_agent.MAX_BOT_TOKEN = old_token
+            news_agent.upload_image_to_max = old_upload
+
+        self.assertTrue(ok)
+        self.assertEqual(calls[0][3]["attachments"][0]["type"], "image")
+        self.assertEqual(calls[0][3]["attachments"][0]["payload"]["token"], "img-token")
+
     def test_publish_to_platforms_succeeds_if_one_platform_succeeds(self):
         old_send_tg = news_agent.send_to_telegram_v2
         old_send_max = news_agent.send_to_max
@@ -179,7 +207,7 @@ class NewsAgentPureTests(unittest.TestCase):
         old_max_chat = news_agent.MAX_CHAT_ID
 
         news_agent.send_to_telegram_v2 = lambda text, chat_id, image_url="": False
-        news_agent.send_to_max = lambda text, chat_id: True
+        news_agent.send_to_max = lambda text, chat_id, image_url="": True
         news_agent.TELEGRAM_TOKEN = "tg"
         news_agent.CHANNEL_ID = "channel"
         news_agent.MAX_BOT_TOKEN = "max"

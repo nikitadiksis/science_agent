@@ -66,6 +66,7 @@ REQUEST_TIMEOUT_AI = 40
 REQUEST_TIMEOUT_TELEGRAM = (10, 30)  # 10 сек подключение, 30 сек ответ
 TELEGRAM_MAX_ATTEMPTS = 2
 TELEGRAM_RETRY_SLEEP_SECONDS = 3
+MAX_MEDIA_RETRY_SLEEP_SECONDS = 2
 TELEGRAM_MESSAGE_LIMIT = 4096
 TELEGRAM_MESSAGE_SAFE_LIMIT = 3900
 TELEGRAM_CAPTION_LIMIT = 1024
@@ -75,6 +76,7 @@ TELEGRAM_HASHTAGS = "#science #news"
 MAX_RSS_ITEMS_PER_FEED = 10
 MAX_RSS_RESPONSE_BYTES = 2_000_000
 MAX_SOURCE_PAGE_BYTES = 600_000
+MAX_IMAGE_DOWNLOAD_BYTES = 15_000_000
 MAX_SUMMARY_CHARS_FROM_FEED = 700
 MAX_LOG_RECORDS = 500
 MAX_RUN_LOG_RECORDS = 100
@@ -2143,7 +2145,103 @@ def telegram_html_to_max_html(text: str) -> str:
     return cleaned
 
 
-def send_to_max(text: str, chat_id: str) -> bool:
+def fetch_image_bytes(image_url: str):
+    if not is_safe_url(image_url):
+        return None, None, None
+
+    try:
+        response = session.get(image_url, timeout=REQUEST_TIMEOUT_SOURCE_PAGE, stream=True)
+        if response.status_code != 200:
+            return None, None, None
+
+        content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if not content_type.startswith("image/"):
+            return None, None, None
+
+        chunks = []
+        total_size = 0
+        for chunk in response.iter_content(chunk_size=8192, decode_unicode=False):
+            if not chunk:
+                continue
+            total_size += len(chunk)
+            if total_size > MAX_IMAGE_DOWNLOAD_BYTES:
+                return None, None, None
+            chunks.append(chunk)
+
+        data = b"".join(chunks)
+        if not data:
+            return None, None, None
+
+        parsed = urlparse(image_url)
+        file_name = os.path.basename(parsed.path) or "image"
+        if "." not in file_name:
+            guessed_ext = {
+                "image/jpeg": ".jpg",
+                "image/png": ".png",
+                "image/gif": ".gif",
+                "image/webp": ".webp",
+                "image/heic": ".heic",
+                "image/bmp": ".bmp",
+                "image/tiff": ".tiff",
+            }.get(content_type, ".jpg")
+            file_name = f"{file_name}{guessed_ext}"
+
+        return data, file_name, content_type
+    except Exception:
+        return None, None, None
+
+
+def upload_image_to_max(image_url: str):
+    if not MAX_BOT_TOKEN or not is_safe_url(image_url):
+        return None
+
+    image_bytes, file_name, content_type = fetch_image_bytes(image_url)
+    if not image_bytes:
+        return None
+
+    headers = {
+        "Authorization": MAX_BOT_TOKEN,
+    }
+
+    try:
+        upload_meta = session.post(
+            "https://platform-api.max.ru/uploads",
+            params={"type": "image"},
+            headers=headers,
+            timeout=REQUEST_TIMEOUT_TELEGRAM,
+        )
+        if upload_meta.status_code not in (200, 201):
+            print(f"   MAX upload init error {upload_meta.status_code}: {upload_meta.text[:250]}")
+            return None
+
+        upload_data = upload_meta.json()
+        upload_url = upload_data.get("url")
+        if not is_safe_url(upload_url):
+            return None
+
+        upload_response = session.post(
+            upload_url,
+            files={"data": (file_name, image_bytes, content_type)},
+            timeout=REQUEST_TIMEOUT_TELEGRAM,
+        )
+        if upload_response.status_code not in (200, 201):
+            print(f"   MAX image upload error {upload_response.status_code}: {upload_response.text[:250]}")
+            return None
+
+        upload_payload = upload_response.json()
+        if not isinstance(upload_payload, dict) or not upload_payload.get("token"):
+            return None
+
+        return {
+            "type": "image",
+            "payload": upload_payload,
+        }
+    except Exception as e:
+        print(f"   MAX image upload exception: {str(e)[:150]}")
+        return None
+
+
+def send_to_max(text: str, chat_id: str, image_url: str = "") -> bool:
     if not MAX_BOT_TOKEN or not chat_id:
         return False
 
@@ -2165,6 +2263,11 @@ def send_to_max(text: str, chat_id: str) -> bool:
         "notify": True,
     }
 
+    if is_safe_url(image_url):
+        attachment = upload_image_to_max(image_url)
+        if attachment:
+            payload["attachments"] = [attachment]
+
     params = {
         "chat_id": str(chat_id),
         "disable_link_preview": "false",
@@ -2185,7 +2288,17 @@ def send_to_max(text: str, chat_id: str) -> bool:
                 print("   MAX sent")
                 return True
 
-            print(f"   MAX error {response.status_code}: {response.text[:250]}")
+            response_text = response.text[:250]
+            if "attachment.not.ready" in response_text.lower() and attempt < TELEGRAM_MAX_ATTEMPTS:
+                print("   MAX attachment not ready yet, retrying")
+                try:
+                    import time
+                    time.sleep(MAX_MEDIA_RETRY_SLEEP_SECONDS * attempt)
+                except Exception:
+                    pass
+                continue
+
+            print(f"   MAX error {response.status_code}: {response_text}")
 
         except requests.exceptions.Timeout:
             print("   MAX timeout")
@@ -2217,7 +2330,7 @@ def publish_to_platforms(text: str, image_url: str = "") -> dict:
         results["telegram"] = send_to_telegram_v2(text, CHANNEL_ID, image_url=image_url)
 
     if MAX_BOT_TOKEN and MAX_CHAT_ID:
-        results["max"] = send_to_max(text, MAX_CHAT_ID)
+        results["max"] = send_to_max(text, MAX_CHAT_ID, image_url=image_url)
 
     results["any_success"] = any(results.values())
     return results
