@@ -2276,10 +2276,19 @@ def upload_image_to_max(image_url: str):
             return None
 
         upload_payload = upload_response.json()
-        if not isinstance(upload_payload, dict) or not upload_payload.get("token"):
+        if not isinstance(upload_payload, dict):
             return None
 
-        return upload_payload.get("token")
+        if upload_payload.get("token"):
+            return upload_payload.get("token")
+
+        photos = upload_payload.get("photos")
+        if isinstance(photos, dict):
+            for _, photo_info in photos.items():
+                if isinstance(photo_info, dict) and photo_info.get("token"):
+                    return photo_info.get("token")
+
+        return None
     except Exception as e:
         print(f"   MAX image upload exception: {str(e)[:150]}")
         return None

@@ -198,6 +198,39 @@ class NewsAgentPureTests(unittest.TestCase):
         self.assertEqual(calls[0][3]["attachments"][0]["type"], "image")
         self.assertEqual(calls[0][3]["attachments"][0]["payload"]["token"], "img-token")
 
+    def test_upload_image_to_max_extracts_token_from_photos_payload(self):
+        class FakeResponse:
+            def __init__(self, status_code, text, json_data=None):
+                self.status_code = status_code
+                self.text = text
+                self._json_data = json_data or {}
+
+            def json(self):
+                return self._json_data
+
+        calls = []
+
+        def fake_post(url, params=None, headers=None, files=None, timeout=None, json=None):
+            calls.append((url, params, headers, files, timeout, json))
+            if "platform-api.max.ru/uploads" in url:
+                return FakeResponse(200, "ok", {"url": "https://upload.example.com/file"})
+            return FakeResponse(200, "ok", {"photos": {"photo-id": {"token": "nested-token"}}})
+
+        old_session = news_agent.session
+        old_token = news_agent.MAX_BOT_TOKEN
+        old_fetch = news_agent.fetch_image_bytes
+        news_agent.session = types.SimpleNamespace(post=fake_post)
+        news_agent.MAX_BOT_TOKEN = "max-token"
+        news_agent.fetch_image_bytes = lambda image_url: (b"png-bytes", "test.png", "image/png")
+        try:
+            token = news_agent.upload_image_to_max("https://example.com/image.png")
+        finally:
+            news_agent.session = old_session
+            news_agent.MAX_BOT_TOKEN = old_token
+            news_agent.fetch_image_bytes = old_fetch
+
+        self.assertEqual(token, "nested-token")
+
     def test_publish_to_platforms_succeeds_if_one_platform_succeeds(self):
         old_send_tg = news_agent.send_to_telegram_v2
         old_send_max = news_agent.send_to_max
