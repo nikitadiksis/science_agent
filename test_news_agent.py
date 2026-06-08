@@ -186,7 +186,7 @@ class NewsAgentPureTests(unittest.TestCase):
         old_upload = news_agent.upload_image_to_max
         news_agent.session = types.SimpleNamespace(post=fake_post)
         news_agent.MAX_BOT_TOKEN = "max-token"
-        news_agent.upload_image_to_max = lambda image_url: {"type": "image", "payload": {"token": "img-token"}}
+        news_agent.upload_image_to_max = lambda image_url: "img-token"
         try:
             ok = news_agent.send_to_max("<b>Hello</b>", "-123", image_url="https://example.com/image.jpg")
         finally:
@@ -244,6 +244,24 @@ class NewsAgentPureTests(unittest.TestCase):
     def test_has_bad_rewrite_artifacts_detects_dialogue_markers(self):
         self.assertTrue(news_agent.has_bad_rewrite_artifacts("Human: fix this"))
         self.assertFalse(news_agent.has_bad_rewrite_artifacts("Title\n\n• fact one\n• fact two\n• fact three"))
+
+    def test_has_bad_rewrite_quality_detects_broken_repeated_words(self):
+        bad = (
+            "Anthropanthropic привлёк $65 млрд\n\n"
+            "Основатель LinkedIn LinkedIn и партнёр Greylock Ррид Хоффман "
+            "сосреднаредоточинаться на своём стартапАп Manus, которй занимается "
+            "раз разработклекой лекарсств с помощискью инт.интллекта."
+        )
+        self.assertTrue(news_agent.has_bad_rewrite_quality(bad))
+
+    def test_has_bad_rewrite_quality_allows_normal_post(self):
+        good = (
+            "Anthropic привлёк $6,5 млрд для развития ИИ\n\n"
+            "Anthropic, создатель Claude, закрыл новый раунд инвестиций.\n"
+            "• Оценка компании выросла до $61,5 млрд\n"
+            "• В раунде участвуют крупные технологические инвесторы"
+        )
+        self.assertFalse(news_agent.has_bad_rewrite_quality(good))
 
 
 if __name__ == "__main__":

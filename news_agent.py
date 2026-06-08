@@ -704,6 +704,48 @@ def has_bad_rewrite_artifacts(text: str) -> bool:
     return False
 
 
+def has_bad_rewrite_quality(text: str) -> bool:
+    if not text:
+        return True
+
+    plain = re.sub(r"<[^>]+>", " ", text)
+    plain = re.sub(r"https?://\S+", " ", plain)
+    words = re.findall(r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\.-]*", plain)
+    if len(words) < 6:
+        return False
+
+    mixed_script_words = 0
+    repeated_fragment_words = 0
+    repeated_word_pairs = 0
+
+    for word in words:
+        has_latin = bool(re.search(r"[A-Za-z]", word))
+        has_cyrillic = bool(re.search(r"[А-Яа-яЁё]", word))
+        if has_latin and has_cyrillic:
+            mixed_script_words += 1
+
+        normalized = re.sub(r"[^A-Za-zА-Яа-яЁё]", "", word.lower())
+        if re.search(r"([a-zа-яё]{2,6})\1", normalized):
+            repeated_fragment_words += 1
+
+    lowered_plain = plain.lower()
+    repeated_word_pairs += len(re.findall(r"\b([a-zа-яё]{2,})\s+\1\b", lowered_plain))
+
+    malformed_words = mixed_script_words + repeated_fragment_words
+    malformed_ratio = malformed_words / max(len(words), 1)
+
+    if repeated_fragment_words >= 2:
+        return True
+    if repeated_word_pairs >= 2:
+        return True
+    if mixed_script_words >= 3:
+        return True
+    if malformed_ratio >= 0.12 and malformed_words >= 3:
+        return True
+
+    return False
+
+
 def is_safe_url(url: str) -> bool:
     try:
         if not url:
@@ -1853,19 +1895,24 @@ def rewrite_v2(title, summary):
         result = re.sub(r"(?i)^(РІРѕС‚ РІРµСЂСЃРёСЏ|РІРѕС‚ С‚РµРєСЃС‚|version|РёС‚Р°Рє)\s*", "", result.strip())
         result = cleanup_rewrite_output(result)
         result = fix_english_words(result)
-        if has_bad_rewrite_artifacts(result):
+        if has_bad_rewrite_artifacts(result) or has_bad_rewrite_quality(result):
             retry_prompt = (
                 build_rewrite_prompt(title, summary)
                 + "\n\nВерни только финальный текст поста."
                 + "\nБез комментариев, без объяснений, без вариантов, без самопроверки."
                 + "\nНельзя писать Human:, Assistant:, 'Вот исправленный вариант' или похожие фразы."
+                + "\nНельзя ломать слова, повторять куски слов или дублировать соседние слова."
             )
             retry_result = ai_chat(retry_prompt, model=AI_MODEL_REWRITE, max_tokens=420)
             if retry_result:
                 retry_result = cleanup_rewrite_output(retry_result)
                 retry_result = fix_english_words(retry_result)
-                if not has_bad_rewrite_artifacts(retry_result):
+                if not has_bad_rewrite_artifacts(retry_result) and not has_bad_rewrite_quality(retry_result):
                     result = retry_result
+                else:
+                    result = "NOT_ENOUGH_FACTS"
+            else:
+                result = "NOT_ENOUGH_FACTS"
     return result
 
 
@@ -2232,10 +2279,7 @@ def upload_image_to_max(image_url: str):
         if not isinstance(upload_payload, dict) or not upload_payload.get("token"):
             return None
 
-        return {
-            "type": "image",
-            "payload": upload_payload,
-        }
+        return upload_payload.get("token")
     except Exception as e:
         print(f"   MAX image upload exception: {str(e)[:150]}")
         return None
@@ -2264,9 +2308,19 @@ def send_to_max(text: str, chat_id: str, image_url: str = "") -> bool:
     }
 
     if is_safe_url(image_url):
-        attachment = upload_image_to_max(image_url)
-        if attachment:
-            payload["attachments"] = [attachment]
+        image_token = upload_image_to_max(image_url)
+        if image_token:
+            payload["attachments"] = [
+                {
+                    "type": "image",
+                    "payload": {
+                        "token": image_token,
+                    },
+                }
+            ]
+            print("   MAX image attachment prepared")
+        else:
+            print("   MAX image attachment skipped: upload failed or token missing")
 
     params = {
         "chat_id": str(chat_id),
@@ -2654,6 +2708,7 @@ def main(dry_run: bool = False):
                 not rewritten or
                 is_not_enough_facts or
                 len(rewritten) < 50 or
+                has_bad_rewrite_quality(rewritten) or
                 any(phrase in rewritten.lower() for phrase in error_phrases)
             )
 
@@ -2771,7 +2826,12 @@ def main(dry_run: bool = False):
                 print("=" * 60)
 
                 rewritten = rewrite(item["title"], item.get("summary", ""))
-                if not rewritten or rewritten.strip().upper() == "NOT_ENOUGH_FACTS" or len(rewritten) < 50:
+                if (
+                    not rewritten or
+                    rewritten.strip().upper() == "NOT_ENOUGH_FACTS" or
+                    len(rewritten) < 50 or
+                    has_bad_rewrite_quality(rewritten)
+                ):
                     stats["rewrite_failed"] += 1
                     continue
 
